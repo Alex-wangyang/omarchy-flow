@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.alexwangyang.omarchy-flow",
+  "name": "Omarchy Flow",
+  "version": "1.0.0",
+  "description": "Flow peers, clipboard status and Bolt device controls.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "FlowWidget.qml"},
+  "barWidget": {
+    "displayName": "Omarchy Flow",
+    "category": "Devices",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {"refreshIntervalSec": 5},
+    "schema": [
+      {"key": "refreshIntervalSec", "type": "integer", "label": "Idle refresh interval (seconds)",
+       "min": 2, "max": 300, "step": 1, "defaultValue": 5}
+    ]
+  }
+}

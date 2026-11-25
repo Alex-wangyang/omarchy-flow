@@ -1,0 +1,16 @@
+[Unit]
+Description=Omarchy Flow peer
+After=graphical-session.target network-online.target
+PartOf=graphical-session.target
+
+[Service]
+EnvironmentFile=-%E/omarchy-flow/daemon.env
+ExecStart=@PYTHON_BIN@ -u @FLOW_DIR@/flow_daemon.py run --advertise $OMARCHY_FLOW_EXTRA_ARGS
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,142 @@
+name: Test release candidate
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      expected_source_sha:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.14'
+      - name: Test release tools and shell syntax
+        run: |
+          python -B -m unittest scripts/test_release.py -v
+          for f in scripts/install.sh scripts/test_install.sh packaging/aur/PKGBUILD packaging/aur/omarchy-flow.install; do bash -n "$f"; done
+      - name: Build, verify and stage committed source
+        env:
+          VERSION: ${{ inputs.version || 'v0.0.0-ci' }}
+          EXPECTED_SHA: ${{ inputs.expected_source_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            test "$GITHUB_REF" = refs/heads/main
+            test "$EXPECTED_SHA" = "$GITHUB_SHA"
+          fi
+          args=(--bundle "$RUNNER_TEMP/bundle" --commit "$GITHUB_SHA" --version "$VERSION")
+          python scripts/release.py build "${args[@]}"
+          python scripts/release.py verify "${args[@]}"
+          python scripts/release.py stage "${args[@]}" --target "$RUNNER_TEMP/stage"
+          if [[ "$VERSION" != *-* && "$VERSION" != *+* ]]; then
+            pkgver=$(sed -n 's/^pkgver=//p' packaging/aur/PKGBUILD)
+            test "$VERSION" = "v$pkgver"
+            digest=$(sha256sum "$RUNNER_TEMP/bundle/omarchy-flow.tar.gz" | cut -d' ' -f1)
+            grep -Fx "sha256sums=('$digest')" packaging/aur/PKGBUILD
+          fi
+      - name: Test staged Linux candidate
+        working-directory: ${{ runner.temp }}/stage
+        run: |
+          python -m venv venv
+          venv/bin/python -m pip install --require-hashes --only-binary=:all: -r requirements.lock
+          venv/bin/python -m pip check
+          python "$GITHUB_WORKSPACE/scripts/release.py" render-units --stage "$PWD" --python "$PWD/venv/bin/python" --out "$PWD/units"
+          PYTHONPATH=src venv/bin/python -B -m unittest discover -s tests -p 'test_*.py' -v
+          python -B -S -m unittest tests/test_flow_bar.py tests/test_flow_i18n.py -v
+          python -m py_compile src/*.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tested-release
+          path: ${{ runner.temp }}/bundle/
+          if-no-files-found: error
+
+  arch-package:
+    needs: candidate
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install Arch build and GTK test dependencies
+        run: |
+          pacman -Syu --noconfirm --needed git jq python python-cryptography python-gobject gtk4 libadwaita hyprland wl-clipboard
+          useradd -m builder
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: tested-release
+          path: candidate-bundle
+      - name: Build, install and verify the candidate package
+        run: |
+          version=$(jq -er .version candidate-bundle/release.json)
+          commit=$(jq -er .source_commit candidate-bundle/release.json)
+          python3 scripts/release.py verify --bundle candidate-bundle --commit "$commit" --version "$version"
+          recipe=/home/builder/recipe
+          cp -r packaging/aur "$recipe"
+          pkgver=$(sed -n 's/^pkgver=//p' "$recipe/PKGBUILD")
+          digest=$(sha256sum candidate-bundle/omarchy-flow.tar.gz | cut -d' ' -f1)
+          if [[ "$version" != *-* && "$version" != *+* ]]; then
+            test "$version" = "v$pkgver"
+          else
+            sed -i "s/^sha256sums=('.*')$/sha256sums=('$digest')/" "$recipe/PKGBUILD"
+            grep -Fx "sha256sums=('$digest')" "$recipe/PKGBUILD"
+          fi
+          cp candidate-bundle/omarchy-flow.tar.gz "$recipe/omarchy-flow-$pkgver.tar.gz"
+          chown -R builder:builder "$recipe"
+          runuser -u builder -- bash -c 'cd "$1" && makepkg --printsrcinfo && makepkg --cleanbuild --noconfirm' _ "$recipe"
+          pacman -U --noconfirm "$recipe"/*.pkg.tar.zst
+          pacman -Qkk omarchy-flow
+          test "$(stat -c %a /usr/lib/omarchy-flow/flow_ui.py)" = 755
+          for f in /usr/lib/omarchy-flow/*.py; do
+            [[ $f == /usr/lib/omarchy-flow/flow_ui.py ]] && continue
+            test "$(stat -c %a "$f")" = 644
+          done
+          plugin=/usr/share/omarchy-flow/omarchy-plugin/io.github.alexwangyang.omarchy-flow
+          for path in /usr/lib/systemd/user/omarchy-flow.service /usr/share/applications/omarchy-flow.desktop \
+              /usr/lib/udev/rules.d/70-omarchy-flow.rules /usr/share/licenses/omarchy-flow/LICENSE \
+              "$plugin/manifest.json" "$plugin/v$pkgver/FlowWidget.qml"; do
+            test -f "$path"
+            test "$(stat -c %a "$path")" = 644
+          done
+          jq -e --arg v "$pkgver" '.version == $v and .entryPoints.barWidget == ("v"+$v+"/FlowWidget.qml")' "$plugin/manifest.json"
+          mapfile -t pkg_files < <(pacman -Qlq omarchy-flow | while IFS= read -r p; do [[ -f $p && ! -L $p ]] && printf '%s\n' "$p"; done)
+          (( ${#pkg_files[@]} > 0 ))
+          if grep -REn '@[A-Za-z_][A-Za-z0-9_]*@' "${pkg_files[@]}"; then exit 1; fi
+      - name: Test offline install, repair and removal
+        run: |
+          python -m venv /tmp/wheel-downloader
+          /tmp/wheel-downloader/bin/pip download --require-hashes --only-binary=:all: -r requirements.lock -d candidate-bundle/wheels
+          runuser -u builder -- scripts/test_install.sh "$PWD/candidate-bundle"
+      - name: Exercise the installed GTK launcher with zero skipped tests
+        run: |
+          root=/home/builder/ui-test
+          mkdir -p "$root/tests"
+          cp tests/test_flow_ui.py "$root/tests"
+          chown -R builder:builder "$root"
+          ln -s /usr/lib/omarchy-flow "$root/src"
+          command -v gtk4-broadwayd
+          cd "$root"
+          runuser -u builder -- /usr/bin/python3 -B - <<'PY'
+          from pathlib import Path
+          import unittest
+          assert Path("src").resolve() == Path("/usr/lib/omarchy-flow")
+          suite = unittest.defaultTestLoader.discover("tests", pattern="test_flow_ui.py")
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(not (result.wasSuccessful() and result.testsRun and not result.skipped))
+          PY

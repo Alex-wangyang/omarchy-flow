@@ -1,0 +1,35 @@
+pkgname=omarchy-flow
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Logitech Flow peer for the Omarchy Wayland desktop'
+arch=('x86_64')
+url='https://github.com/Alex-wangyang/omarchy-flow'
+license=('MIT')
+depends=('python' 'python-cryptography' 'python-gobject' 'gtk4' 'libadwaita'
+         'hyprland' 'wl-clipboard' 'systemd')
+makedepends=('jq')
+optdepends=('quickshell: Omarchy Shell bar widget' 'imagemagick: additional image clipboard formats')
+install=omarchy-flow.install
+source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/omarchy-flow.tar.gz")
+sha256sums=('e5e7575b0a4cb01334336f3af2b91bf27829b9121cec05eaee3b462206f72deb')
+
+package() {
+    local flow=/usr/lib/omarchy-flow id=io.github.alexwangyang.omarchy-flow
+    local plugin="$pkgdir/usr/share/omarchy-flow/omarchy-plugin/$id"
+    local unit="$pkgdir/usr/lib/systemd/user/omarchy-flow.service"
+    local desktop="$pkgdir/usr/share/applications/omarchy-flow.desktop"
+    cd "$srcdir"
+    install -d "$pkgdir$flow" "${unit%/*}" "${desktop%/*}" "$plugin/v$pkgver"
+    install -m644 src/*.py "$pkgdir$flow/"
+    chmod 755 "$pkgdir$flow/flow_ui.py"
+    sed -e "s|@FLOW_DIR@|$flow|g" -e 's|@PYTHON_BIN@|/usr/bin/python3|g' \
+        packaging/omarchy-flow.service.in > "$unit"
+    sed "s|@FLOW_DIR@|$flow|g" packaging/omarchy-flow.desktop.in > "$desktop"
+    sed -e "s|@BAR_HELPER@|$flow/flow_bar.py|g" -e "s|@OPEN_SETTINGS@|exec $flow/flow_ui.py|g" \
+        packaging/omarchy-plugin/FlowWidget.qml.in > "$plugin/v$pkgver/FlowWidget.qml"
+    jq --arg v "$pkgver" '.version=$v | .entryPoints.barWidget=("v"+$v+"/FlowWidget.qml")' \
+        packaging/omarchy-plugin/manifest.json > "$plugin/manifest.json"
+    chmod 644 "$unit" "$desktop" "$plugin/manifest.json" "$plugin/v$pkgver/FlowWidget.qml"
+    install -Dm644 packaging/70-omarchy-flow.rules "$pkgdir/usr/lib/udev/rules.d/70-omarchy-flow.rules"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

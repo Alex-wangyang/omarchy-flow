@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Omarchy Flow
+Comment=Configure Logitech Flow computers and Bolt devices
+Exec="@FLOW_DIR@/flow_ui.py"
+Icon=input-mouse
+Terminal=false
+Categories=Settings;HardwareSettings;
+StartupWMClass=io.github.alexwangyang.OmarchyFlow

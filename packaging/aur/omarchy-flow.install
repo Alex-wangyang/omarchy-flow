@@ -1,0 +1,16 @@
+post_install() {
+    cat <<'HELP'
+Reconnect the Bolt receiver after udev reloads. With both devices active on their
+Linux channels, run as your desktop user:
+  /usr/bin/python3 /usr/lib/omarchy-flow/flow_daemon.py provision
+  systemctl --user daemon-reload
+  systemctl --user enable --now omarchy-flow.service
+
+For the optional bar widget, create ~/.config/omarchy/plugins and link
+/usr/share/omarchy-flow/omarchy-plugin/io.github.alexwangyang.omarchy-flow
+into it. Enable the widget in Omarchy. See the README for peer-scoped UFW rules.
+HELP
+}
+post_upgrade() {
+    echo 'Refresh the user unit with systemctl --user daemon-reload and restart omarchy-flow.service when ready.'
+}

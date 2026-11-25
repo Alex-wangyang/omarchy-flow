@@ -1,0 +1,2 @@
+SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="046d", ENV{ID_MODEL_ID}=="c548", ATTRS{bInterfaceNumber}=="02", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_VENDOR_ID}=="046d", ENV{ID_MODEL_ID}=="c548", ATTRS{bInterfaceNumber}=="01", ENV{ID_INPUT_MOUSE}=="1", TAG+="uaccess"

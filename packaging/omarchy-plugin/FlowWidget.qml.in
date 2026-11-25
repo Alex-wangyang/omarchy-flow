@@ -1,0 +1,305 @@
+import QtQuick
+import QtQuick.Layouts
+import Quickshell.Io
+import qs.Commons
+import qs.Commons as Commons
+import qs.Ui
+
+Panel {
+  id: widget
+  moduleName: "io.github.alexwangyang.omarchy-flow"
+  ipcTarget: moduleName
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  readonly property string helper: "@BAR_HELPER@"
+  readonly property string openSettingsCommand: "@OPEN_SETTINGS@"
+  readonly property color ink: bar ? bar.foreground : Commons.Color.foreground
+  readonly property string family: bar ? bar.fontFamily : Style.font.family
+  property var snapshot: ({online: false})
+  readonly property string lang: snapshot.language === "zh" ? "zh" : "en"
+  function t(en, zh) { return lang === "zh" ? zh : en }
+
+  readonly property bool online: snapshot.online === true
+  readonly property var peers: snapshot.peers || []
+  readonly property int connected: peers.filter(p => p.enabled && p.connected).length
+  readonly property var clip: snapshot.clipboard || ({})
+  readonly property string stateText: !online ? t("Daemon Offline", "服务离线")
+    : !snapshot.local_enabled ? t("Local Disabled", "本机已禁用")
+    : snapshot.flow_on ? t("Flow On", "Flow 已开启") : t("Flow Off", "Flow 已关闭")
+  readonly property string clipText: !online ? t("Unavailable", "不可用")
+    : clip.busy ? t("Transferring", "传输中")
+    : clip.enabled ? t("Ready", "就绪") : t("Disabled", "已禁用")
+  readonly property string peerCount: t(connected + (connected === 1 ? " peer connected" : " peers connected"),
+                                        "已连接 " + connected + " 台电脑")
+  readonly property string modifier: snapshot.preferences && snapshot.preferences.modifier_key || ""
+  readonly property int idleSeconds: Math.max(2, Math.min(300, Number(setting("refreshIntervalSec", 5)) || 5))
+  readonly property var switchKeys: ["on", "copy_paste", "keyboard_link", "ctrl_key"]
+  property int cursor: -1
+  property string operation: ""
+  property var pendingAction: null
+  readonly property bool editing: pendingAction !== null || (operation !== "" && operation !== "status")
+  property string notice: ""
+  property string noticeLanguage: ""
+
+  function start(args) {
+    if (operation !== "" || bridge.running) return
+    operation = args[0]
+    bridge.command = ["/usr/bin/python3", "-B", "-S", helper].concat(args)
+    bridge.running = true
+  }
+
+  function refresh() { start(["status"]) }
+
+  function perform(index) {
+    if (index === 5) {
+      if (bar) bar.run(openSettingsCommand)
+      close()
+      return
+    }
+    if (!online || editing || index < 0 || index > 4) return
+    if (index === 0 && !snapshot.local_enabled) return
+    let args = ["rescan"]
+    if (index < switchKeys.length) {
+      const key = switchKeys[index]
+      const checked = index === 0 ? snapshot.flow_on : snapshot.settings[key]
+      args = ["set-setting", key, checked ? "off" : "on"]
+    }
+    notice = ""
+    if (operation === "status") pendingAction = args
+    else start(args)
+  }
+
+  function finished(code) {
+    const wasAction = operation !== "status"
+    let reply = null
+    try { reply = JSON.parse(resultStream.text) } catch (e) {}
+    if (code === 0 && reply && typeof reply.online === "boolean") snapshot = reply
+    else if (!wasAction) snapshot = {online: false, language: lang}
+    if (wasAction) {
+      noticeLanguage = reply && reply.language || lang
+      notice = reply && reply.notice || (code === 0 ? "" : t("Action unconfirmed. Refreshing status.", "操作尚未确认。正在刷新状态。"))
+    }
+    const next = pendingAction
+    pendingAction = null
+    operation = ""
+    if (next && online) start(next)
+    else if (wasAction) refresh()
+  }
+
+  Component.onCompleted: refresh()
+  onOpenedChanged: if (opened) {
+    cursor = online ? 0 : 5
+    notice = ""
+    refresh()
+  }
+  onOnlineChanged: if (opened && !online) cursor = 5
+
+  Timer {
+    interval: widget.opened ? 1000 : widget.idleSeconds * 1000
+    running: true
+    repeat: true
+    onTriggered: widget.refresh()
+  }
+
+  Process {
+    id: bridge
+    stdout: StdioCollector { id: resultStream; waitForEnd: true }
+    onExited: function(code) { widget.finished(code) }
+  }
+
+  BarIconButton {
+    id: button
+    anchors.fill: parent
+    bar: widget.bar
+    text: "⇄"
+    dimmed: !widget.online || !widget.snapshot.flow_on || widget.connected === 0
+    tooltipText: widget.opened ? "" : widget.stateText + (widget.online ?
+      " · " + widget.peerCount + "\n" + widget.t("Owner: ", "控制端：") + (widget.snapshot.active_owner || widget.t("Unknown", "未知")) +
+      " · " + widget.t("Clipboard: ", "剪贴板：") + widget.clipText : "")
+    onTooltipTextChanged: if (bar && tooltipHovered) {
+      if (tooltipText) bar.showTooltip(button, tooltipText)
+      else bar.hideTooltip(button)
+    }
+    onPressed: function(code) {
+      if (code === Qt.RightButton) widget.perform(0)
+      else if (code === Qt.MiddleButton) widget.refresh()
+      else if (code === Qt.LeftButton) widget.toggle()
+    }
+    Rectangle {
+      visible: widget.online && (widget.clip.busy || (widget.snapshot.flow_on && widget.connected > 0))
+      anchors.right: parent.right
+      anchors.bottom: parent.bottom
+      anchors.margins: Style.space(2)
+      width: Style.space(5)
+      height: width
+      radius: width / 2
+      color: widget.clip.busy ? Commons.Color.accent : widget.barForeground
+    }
+  }
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: button
+    owner: widget
+    bar: widget.bar
+    open: widget.opened
+    focusTarget: loadedContent
+    contentWidth: fittedContentWidth(Style.space(360))
+    contentHeight: fittedContentHeight(loadedContentHeight, Style.space(600))
+
+    content: PanelKeyCatcher {
+      id: card
+      implicitHeight: stack.implicitHeight
+      anchors.fill: parent
+
+      function move(step) {
+        widget.cursor = widget.online ? (widget.cursor + step + 6) % 6 : 5
+        const row = [hero, switches.itemAt(0), switches.itemAt(1), switches.itemAt(2), rescan, full][widget.cursor]
+        if (!row) return
+        const y = row.mapToItem(scroll.contentItem, 0, 0).y
+        if (y < scroll.contentY) scroll.contentY = y
+        else if (y + row.height > scroll.contentY + scroll.height)
+          scroll.contentY = Math.min(scroll.contentHeight - scroll.height, y + row.height - scroll.height)
+      }
+      onTabRequested: direction => move(direction)
+      onMoveRequested: (dx, dy) => move(dx || dy)
+      onActivateRequested: widget.perform(widget.cursor)
+      onCloseRequested: widget.close()
+
+      Flickable {
+        id: scroll
+        anchors.fill: parent
+        clip: true
+        contentWidth: width
+        contentHeight: stack.implicitHeight
+        boundsBehavior: Flickable.StopAtBounds
+
+        Column {
+          id: stack
+          width: scroll.width
+          spacing: Style.spacing.labelGap
+
+          PanelHero {
+            id: hero
+            title: "Omarchy Flow"
+            meta: widget.stateText + (widget.online ? " · " + widget.peerCount : "")
+            foreground: widget.ink
+            fontFamily: widget.family
+            trailingControl: ToggleSwitch {
+              enabled: widget.online && !!widget.snapshot.local_enabled
+              opacity: enabled ? 1 : 0.45
+              checked: !!widget.snapshot.flow_on
+              hasCursor: widget.cursor === 0
+              busy: widget.editing
+              onHovered: on => { if (on) widget.cursor = 0 }
+              onToggled: widget.perform(0)
+            }
+          }
+
+          Info { visible: widget.notice !== "" && widget.noticeLanguage === widget.lang; text: widget.notice }
+          Heading { visible: widget.online; text: widget.t("Peers", "电脑") }
+          PeerRow {
+            visible: widget.online
+            host: widget.snapshot.host_id || widget.t("Local host", "本机")
+            detail: widget.snapshot.local_enabled ? widget.t("Local", "本机") : widget.t("Local · Disabled", "本机 · 已禁用")
+          }
+          Repeater {
+            model: widget.peers
+            PeerRow {
+              required property var modelData
+              host: modelData.host_id
+              detail: (modelData.enabled ? widget.t("Enabled", "已启用") : widget.t("Disabled", "已禁用")) +
+                " · " + (modelData.connected ? widget.t("Connected", "已连接") : widget.t("Disconnected", "未连接"))
+            }
+          }
+
+          Heading { visible: widget.online; text: widget.t("Quick settings", "快捷设置") }
+          Repeater {
+            id: switches
+            model: [widget.t("Copy & Paste", "复制和粘贴"), widget.t("Keyboard Link", "链接键盘"), widget.t("Modifier Hold", "按住修饰键")]
+            Toggle {
+              required property string modelData
+              required property int index
+              width: stack.width
+              visible: widget.online
+              enabled: widget.online && !widget.editing
+              label: modelData + (index === 2 && widget.modifier ? " · " +
+                widget.modifier[0].toUpperCase() + widget.modifier.slice(1) : "")
+              checked: !!(widget.snapshot.settings && widget.snapshot.settings[widget.switchKeys[index + 1]])
+              hasCursor: widget.cursor === index + 1
+              onHovered: on => { if (on) widget.cursor = index + 1 }
+              onClicked: widget.perform(index + 1)
+            }
+          }
+
+          Heading { visible: widget.online; text: widget.t("Clipboard", "剪贴板") }
+          Info {
+            visible: widget.online
+            text: widget.clipText + (widget.clip.display_summary ? " · " + widget.clip.display_summary : "")
+          }
+
+          RowLayout {
+            width: parent.width
+            FooterAction { id: rescan; position: 4; iconText: widget.t("Rescan Bolt", "重新扫描 Bolt"); enabled: widget.online && !widget.editing }
+            FooterAction { id: full; position: 5; iconText: widget.t("Open Full Settings", "打开完整设置") }
+          }
+        }
+      }
+    }
+  }
+
+  component Heading: PanelSectionHeader {
+    foreground: widget.ink
+    fontFamily: widget.family
+  }
+  component Info: Text {
+    width: parent.width
+    color: widget.ink
+    font.family: widget.family
+    font.pixelSize: Style.font.body
+    textFormat: Text.PlainText
+    wrapMode: Text.Wrap
+  }
+  component PeerRow: RowLayout {
+    id: peer
+    required property string host
+    required property string detail
+    width: parent.width
+
+    Info {
+      Layout.fillWidth: true
+      text: peer.host + " · " + peer.detail
+    }
+    BorderSurface {
+      visible: peer.host === widget.snapshot.active_owner
+      radius: Style.cornerRadius
+      color: "transparent"
+      borderSpec: Border.controlSpec("normal", widget.ink, Commons.Color.accent)
+      implicitWidth: ownerLabel.implicitWidth + Style.space(10)
+      implicitHeight: ownerLabel.implicitHeight + Style.space(4)
+      Text {
+        id: ownerLabel
+        anchors.centerIn: parent
+        text: widget.t("Active owner", "当前控制端")
+        color: widget.ink
+        font.family: widget.family
+        font.pixelSize: Style.font.caption
+      }
+    }
+  }
+  component FooterAction: PanelActionButton {
+    required property int position
+    Layout.fillWidth: true
+    Layout.preferredWidth: implicitWidth
+    implicitWidth: metrics.advanceWidth(iconText) + Style.space(16)
+    FontMetrics { id: metrics; font.family: widget.family; font.pixelSize: Style.font.body }
+    bordered: true
+    hasCursor: widget.cursor === position
+    fontFamily: widget.family
+    fontSize: Style.font.body
+    foreground: widget.ink
+    onHovered: on => { if (on) widget.cursor = position }
+    onClicked: widget.perform(position)
+  }
+}

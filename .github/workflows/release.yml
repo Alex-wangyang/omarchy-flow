@@ -1,0 +1,160 @@
+name: Publish immutable release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: New vMAJOR.MINOR.PATCH tag (optional prerelease or build metadata)
+        required: true
+        type: string
+      expected_source_sha:
+        description: Full SHA of the reviewed main commit
+        required: true
+        type: string
+      prerelease:
+        description: Mark this version as a prerelease
+        required: false
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: omarchy-flow-release
+  cancel-in-progress: false
+jobs:
+  candidate:
+    uses: ./.github/workflows/ci.yml
+    with:
+      version: ${{ inputs.version }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+  publish:
+    if: github.ref == 'refs/heads/main'
+    needs: candidate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: tested-release
+          path: ${{ runner.temp }}/bundle
+      - name: Check repository immutable-release setting when configured
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_PREFLIGHT_TOKEN }}
+        run: |
+          if [[ -n "$GH_TOKEN" ]]; then
+            gh api "repos/$GITHUB_REPOSITORY/immutable-releases" | jq -e '.enabled == true'
+          fi
+      - name: Publish and read back release identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/bundle"
+          python3 scripts/release.py verify --bundle "$bundle" --commit "$GITHUB_SHA" --version "$VERSION"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" = "$GITHUB_SHA"
+          tags=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$VERSION" --paginate --jq '.[].ref')
+          if grep -Fxq "refs/tags/$VERSION" <<< "$tags"; then exit 1; fi
+          release_tags=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq '.[].tag_name')
+          if grep -Fxq -- "$VERSION" <<< "$release_tags"; then
+            echo "Existing release or draft found for $VERSION; inspect before retrying." >&2
+            exit 1
+          fi
+          base_ver="${VERSION%%+*}"
+          expected_pre=false
+          if [[ "$base_ver" == *-* ]]; then expected_pre=true; fi
+          test "$PRERELEASE" = "$expected_pre"
+          release_id=''
+          verified=false
+          fetch_release() {
+            local out=$1 attempt
+            for attempt in 1 2 3; do
+              if gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$out"; then
+                return 0
+              fi
+              sleep 2
+            done
+            return 1
+          }
+          reconcile_on_exit() {
+            local status=$?
+            set +e
+            if [[ $verified == true || -z $release_id ]]; then return "$status"; fi
+            local state="$RUNNER_TEMP/reconcile.json"
+            if fetch_release "$state"; then
+              if jq -e '.draft == true' "$state" >/dev/null; then
+                if gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$release_id" >/dev/null; then
+                  echo "Cleaned up unpublished draft release $release_id for $VERSION." >&2
+                else
+                  echo "FAILED to delete unpublished draft release $release_id for $VERSION; inspect GitHub releases manually." >&2
+                fi
+              elif jq -e '.immutable != true' "$state" >/dev/null; then
+                if gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$release_id" >/dev/null; then
+                  if gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$VERSION" >/dev/null; then
+                    echo "Cleaned up mutable release $release_id and tag $VERSION." >&2
+                  else
+                    echo "Deleted mutable release $release_id, but FAILED to delete tag $VERSION; inspect tags manually." >&2
+                  fi
+                else
+                  echo "FAILED to delete mutable release $release_id for $VERSION; tag $VERSION left untouched for manual inspection." >&2
+                fi
+              else
+                echo "Release $release_id for $VERSION is already published and immutable; inspect before retrying." >&2
+              fi
+            else
+              echo "Unable to reconcile release $release_id for $VERSION; inspect GitHub releases before retrying." >&2
+            fi
+            return "$status"
+          }
+          trap reconcile_on_exit EXIT
+          gh api -X POST "repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="$VERSION" \
+            -f target_commitish="$GITHUB_SHA" \
+            -f name="$VERSION" \
+            -f body="Source $GITHUB_SHA. Workflow $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID." \
+            -F draft=true \
+            -F prerelease="$PRERELEASE" > "$RUNNER_TEMP/draft.json"
+          release_id=$(jq -er '.id' "$RUNNER_TEMP/draft.json")
+          upload_base=$(jq -er '.upload_url | sub("\\{.*$"; "")' "$RUNNER_TEMP/draft.json")
+          for asset in SHA256SUMS omarchy-flow.tar.gz release.json; do
+            gh api -X POST "${upload_base}?name=${asset}" \
+              -H "Content-Type: application/octet-stream" \
+              --input "$bundle/$asset" > /dev/null
+          done
+          names='["SHA256SUMS","omarchy-flow.tar.gz","release.json"]'
+          fetch_release "$RUNNER_TEMP/draft-check.json"
+          jq -e --arg sha "$GITHUB_SHA" --arg tag "$VERSION" --argjson pre "$PRERELEASE" --argjson names "$names" \
+            '.draft == true and .tag_name == $tag and .target_commitish == $sha and .prerelease == $pre and ([.assets[].name] | sort) == $names' \
+            "$RUNNER_TEMP/draft-check.json" > /dev/null
+          publish_ok=true
+          if ! gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -F draft=false > "$RUNNER_TEMP/publish.json"; then
+            publish_ok=false
+          fi
+          fetch_release "$RUNNER_TEMP/receipt.json"
+          if jq -e '.draft == true' "$RUNNER_TEMP/receipt.json" >/dev/null; then
+            echo "Release $release_id remained a draft after publish attempt." >&2
+            exit 1
+          fi
+          if ! jq -e '.immutable == true' "$RUNNER_TEMP/receipt.json" >/dev/null; then
+            echo "Release $release_id was published without immutability; cleaning up." >&2
+            exit 1
+          fi
+          if [[ $publish_ok == false ]]; then
+            echo "Publish request returned an error, but release $release_id is published and immutable; continuing verification." >&2
+          fi
+          jq -e --arg tag "$VERSION" --argjson pre "$PRERELEASE" --argjson names "$names" \
+            '.immutable == true and .draft == false and .tag_name == $tag and .prerelease == $pre and ([.assets[].name] | sort) == $names' \
+            "$RUNNER_TEMP/receipt.json" > /dev/null
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$VERSION" --jq .sha)" = "$GITHUB_SHA"
+          gh release verify "$VERSION" -R "$GITHUB_REPOSITORY"
+          for asset in SHA256SUMS omarchy-flow.tar.gz release.json; do gh release verify-asset "$VERSION" "$bundle/$asset" -R "$GITHUB_REPOSITORY"; done
+          verified=true
+          jq '{id,html_url,assets:[.assets[]|{id,name,digest}]}' "$RUNNER_TEMP/receipt.json"
